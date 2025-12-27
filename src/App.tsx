@@ -1,4 +1,3 @@
-import { useState } from "react";
 import SprintBoard from "./pages/SprintBoard";
 
 function App() {
