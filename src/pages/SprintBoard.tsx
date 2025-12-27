@@ -53,10 +53,14 @@ type ModalMode =
   | { open: true; mode: "rename_column"; columnId: ColumnId };
 
 const STORAGE_BOARD_ID = "sb_board_id";
+const STORAGE_ACCOUNT_ID = "sb_account_id";
+
+// ✅ FIXED values as requested
+const FIXED_BOARD_ID = "694fe0d7e3fa03c0dee63367";
+const FIXED_ACCOUNT_ID = "demo-account";
 const DEFAULT_API_BASE = "https://73b479c528ee.ngrok-free.app";
 
 function getApiBase() {
-  // ปรับได้: (window as any).__API_BASE__ = "https://your-api"
   return (window as any).__API_BASE__ || DEFAULT_API_BASE;
 }
 
@@ -118,13 +122,14 @@ async function apiFetch<T>(
 }
 
 export default function SprintBoardApi() {
-  const [accountId, setAccountId] = useState<string>(() => {
-    return localStorage.getItem("sb_account_id") || "demo-account";
+  // ✅ fixed accountId from localStorage or fallback
+  const [accountId] = useState<string>(() => {
+    return localStorage.getItem(STORAGE_ACCOUNT_ID) || FIXED_ACCOUNT_ID;
   });
 
-  useEffect(() => {
-    localStorage.setItem("sb_account_id", accountId);
-  }, [accountId]);
+  const [boardId] = useState<string>(() => {
+    return localStorage.getItem(STORAGE_BOARD_ID) || FIXED_BOARD_ID;
+  });
 
   const [board, setBoard] = useState<BoardState | null>(null);
   const [loading, setLoading] = useState(false);
@@ -132,90 +137,72 @@ export default function SprintBoardApi() {
 
   const [modal, setModal] = useState<ModalMode>({ open: false });
 
-  // drag snapshot เพื่อรู้ว่าต้อง sync หรือไม่
+  const activeCardIdRef = useRef<string | null>(null);
+  const [activeCardId, setActiveCardId] = useState<string | null>(null);
+
+  const boardRef = useRef<BoardState | null>(null);
+  useEffect(() => {
+    boardRef.current = board;
+  }, [board]);
+
+  // drag snapshot
   const dragStartRef = useRef<{
     cardId: string;
     fromColId: string;
     fromIndex: number;
   } | null>(null);
 
+  // pending sync move (trigger after optimistic update)
+  const pendingMoveRef = useRef<string | null>(null);
+
   const sensors = useSensors(
     useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
   );
-
-  const activeCardIdRef = useRef<string | null>(null);
-  const [activeCardId, setActiveCardId] = useState<string | null>(null);
 
   const activeCard = useMemo(() => {
     if (!board || !activeCardId) return null;
     return board.cardsById[activeCardId] || null;
   }, [board, activeCardId]);
 
-  async function refresh(boardId: string) {
+  // ✅ ensure localStorage keys exist (create if missing)
+  useEffect(() => {
+    const curAcc = localStorage.getItem(STORAGE_ACCOUNT_ID);
+    if (!curAcc) localStorage.setItem(STORAGE_ACCOUNT_ID, FIXED_ACCOUNT_ID);
+
+    const curBoard = localStorage.getItem(STORAGE_BOARD_ID);
+    if (!curBoard) localStorage.setItem(STORAGE_BOARD_ID, FIXED_BOARD_ID);
+  }, []);
+
+  async function refresh(bid: string) {
     setLoading(true);
     setErrMsg(null);
     try {
       const r = await apiFetch<{ ok: true; state: BoardState }>(
-        `/boards/${boardId}`,
+        `/boards/${bid}`,
         {
           accountId,
         }
       );
       setBoard(r.state);
-      localStorage.setItem(STORAGE_BOARD_ID, boardId);
+      localStorage.setItem(STORAGE_BOARD_ID, bid);
+      localStorage.setItem(STORAGE_ACCOUNT_ID, accountId);
     } catch (e: any) {
-      setErrMsg(e?.message || "Failed to load board");
+      setErrMsg(
+        e?.message ||
+          "Failed to load board (check API_BASE / backend / Mongo has this boardId)"
+      );
       setBoard(null);
     } finally {
       setLoading(false);
     }
   }
 
-  async function ensureBoard() {
-    setLoading(true);
-    setErrMsg(null);
-    try {
-      let boardId = localStorage.getItem(STORAGE_BOARD_ID);
-
-      if (boardId) {
-        // try load
-        try {
-          const r = await apiFetch<{ ok: true; state: BoardState }>(
-            `/boards/${boardId}`,
-            {
-              accountId,
-            }
-          );
-          setBoard(r.state);
-          setLoading(false);
-          return;
-        } catch {
-          // if not found -> create new
-          boardId = null;
-        }
-      }
-
-      const created = await apiFetch<{ ok: true; boardId: string }>(`/boards`, {
-        method: "POST",
-        body: {
-          name: "Sprint Board",
-          columns: ["To Do", "In Progress", "Done"],
-        },
-        accountId,
-      });
-      await refresh(created.boardId);
-    } catch (e: any) {
-      setErrMsg(e?.message || "Failed to init board");
-      setBoard(null);
-      setLoading(false);
-    }
-  }
-
+  // load once
   useEffect(() => {
-    ensureBoard();
+    void refresh(boardId);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [accountId]);
+  }, []);
 
   // ---------- Mutations ----------
   async function addColumn(title: string) {
@@ -237,7 +224,6 @@ export default function SprintBoardApi() {
     if (!board) return;
     setErrMsg(null);
 
-    // optimistic
     setBoard((prev) => {
       if (!prev) return prev;
       return {
@@ -283,7 +269,7 @@ export default function SprintBoardApi() {
 
   async function createCard(
     columnId: string,
-    data: Omit<Card, "id" | "columnId" | "rank">
+    data: { title: string; description: string; points: number }
   ) {
     if (!board) return;
     setErrMsg(null);
@@ -306,17 +292,13 @@ export default function SprintBoardApi() {
     if (!board) return;
     setErrMsg(null);
 
-    // optimistic
     setBoard((prev) => {
       if (!prev) return prev;
       const cur = prev.cardsById[cardId];
       if (!cur) return prev;
       return {
         ...prev,
-        cardsById: {
-          ...prev.cardsById,
-          [cardId]: { ...cur, ...patch },
-        },
+        cardsById: { ...prev.cardsById, [cardId]: { ...cur, ...patch } },
       };
     });
 
@@ -337,15 +319,16 @@ export default function SprintBoardApi() {
     if (!board) return;
     setErrMsg(null);
 
-    // optimistic remove
     setBoard((prev) => {
       if (!prev) return prev;
       const nextCards = { ...prev.cardsById };
       delete nextCards[cardId];
+
       const nextMap: Record<string, string[]> = { ...prev.columnCardIds };
       for (const colId of Object.keys(nextMap)) {
         nextMap[colId] = (nextMap[colId] || []).filter((id) => id !== cardId);
       }
+
       return { ...prev, cardsById: nextCards, columnCardIds: nextMap };
     });
 
@@ -361,59 +344,61 @@ export default function SprintBoardApi() {
     }
   }
 
-  async function syncMoveCard(cardId: string) {
-    if (!board) return;
-
-    const toColId = findContainerOf(cardId, board.columnCardIds, board.columns);
+  async function syncMoveCardFromSnapshot(
+    snapshot: BoardState,
+    cardId: string
+  ) {
+    const toColId = findContainerOf(
+      cardId,
+      snapshot.columnCardIds,
+      snapshot.columns
+    );
     if (!toColId) return;
 
-    const list = board.columnCardIds[toColId] || [];
+    const list = snapshot.columnCardIds[toColId] || [];
     const idx = list.indexOf(cardId);
     if (idx === -1) return;
 
     const beforeCardId = idx > 0 ? list[idx - 1] : null;
     const afterCardId = idx < list.length - 1 ? list[idx + 1] : null;
 
-    try {
-      await apiFetch(`/boards/${board.boardId}/cards/${cardId}/move`, {
-        method: "POST",
-        body: {
-          toColumnId: toColId,
-          beforeCardId,
-          afterCardId,
-        },
-        accountId,
-      });
-      await refresh(board.boardId);
-    } catch (e: any) {
-      setErrMsg(e?.message || "Move sync failed");
-      await refresh(board.boardId);
-    }
+    await apiFetch(`/boards/${snapshot.boardId}/cards/${cardId}/move`, {
+      method: "POST",
+      body: {
+        toColumnId: toColId,
+        beforeCardId,
+        afterCardId,
+      },
+      accountId,
+    });
   }
 
-  // ---------- DnD handlers (optimistic + sync) ----------
+  // ---------- DnD ----------
   function handleDragStart(e: any) {
-    if (!board) return;
+    const cur = boardRef.current;
+    if (!cur) return;
+
     const id = String(e.active.id);
-    if (isColumnId(id, board.columns)) return;
+    if (isColumnId(id, cur.columns)) return;
 
     activeCardIdRef.current = id;
     setActiveCardId(id);
 
-    const fromCol = findContainerOf(id, board.columnCardIds, board.columns);
+    const fromCol = findContainerOf(id, cur.columnCardIds, cur.columns);
     if (!fromCol) return;
 
-    const fromIndex = (board.columnCardIds[fromCol] || []).indexOf(id);
+    const fromIndex = (cur.columnCardIds[fromCol] || []).indexOf(id);
     dragStartRef.current = { cardId: id, fromColId: fromCol, fromIndex };
   }
 
   function handleDragOver(e: any) {
-    if (!board) return;
+    const cur = boardRef.current;
+    if (!cur) return;
 
     const activeId = String(e.active.id);
     const overId = e.over ? String(e.over.id) : null;
     if (!overId) return;
-    if (isColumnId(activeId, board.columns)) return;
+    if (isColumnId(activeId, cur.columns)) return;
 
     setBoard((prev) => {
       if (!prev) return prev;
@@ -426,7 +411,7 @@ export default function SprintBoardApi() {
       const overCol = findContainerOf(overId, prev.columnCardIds, prev.columns);
       if (!activeCol || !overCol) return prev;
 
-      if (activeCol === overCol) return prev; // reorder within same col handled onDragEnd
+      if (activeCol === overCol) return prev;
 
       const activeList = prev.columnCardIds[activeCol] || [];
       const overList = prev.columnCardIds[overCol] || [];
@@ -443,7 +428,6 @@ export default function SprintBoardApi() {
 
       const nextOverList = insertAt(overList, newIndex, activeId);
 
-      // also update card's columnId locally for UI
       const nextCards = { ...prev.cardsById };
       const c = nextCards[activeId];
       if (c) nextCards[activeId] = { ...c, columnId: overCol };
@@ -461,7 +445,8 @@ export default function SprintBoardApi() {
   }
 
   function handleDragEnd(e: any) {
-    if (!board) return;
+    const cur = boardRef.current;
+    if (!cur) return;
 
     const activeId = String(e.active.id);
     const overId = e.over ? String(e.over.id) : null;
@@ -470,9 +455,11 @@ export default function SprintBoardApi() {
     activeCardIdRef.current = null;
 
     if (!overId) return;
-    if (isColumnId(activeId, board.columns)) return;
+    if (isColumnId(activeId, cur.columns)) return;
 
-    // reorder within same column
+    const snap = dragStartRef.current;
+    dragStartRef.current = null;
+
     setBoard((prev) => {
       if (!prev) return prev;
 
@@ -484,100 +471,105 @@ export default function SprintBoardApi() {
       const overCol = findContainerOf(overId, prev.columnCardIds, prev.columns);
       if (!activeCol || !overCol) return prev;
 
-      // if moved across columns, we already updated order in onDragOver
-      if (activeCol !== overCol) return prev;
+      // reorder within same column
+      if (activeCol === overCol) {
+        const list = prev.columnCardIds[activeCol] || [];
+        const oldIndex = list.indexOf(activeId);
+        if (oldIndex === -1) return prev;
 
-      const list = prev.columnCardIds[activeCol] || [];
-      const oldIndex = list.indexOf(activeId);
-      if (oldIndex === -1) return prev;
+        let newIndex = list.length - 1;
+        if (!isColumnId(overId, prev.columns)) {
+          const overIndex = list.indexOf(overId);
+          if (overIndex !== -1) newIndex = overIndex;
+        }
 
-      let newIndex = list.length - 1; // drop on column body -> end
-      if (!isColumnId(overId, prev.columns)) {
-        const overIndex = list.indexOf(overId);
-        if (overIndex !== -1) newIndex = overIndex;
+        if (oldIndex === newIndex) return prev;
+
+        const next = {
+          ...prev,
+          columnCardIds: {
+            ...prev.columnCardIds,
+            [activeCol]: arrayMove(list, oldIndex, newIndex),
+          },
+        };
+
+        // queue sync
+        if (snap) pendingMoveRef.current = activeId;
+        return next;
       }
 
-      if (oldIndex === newIndex) return prev;
-
-      return {
-        ...prev,
-        columnCardIds: {
-          ...prev.columnCardIds,
-          [activeCol]: arrayMove(list, oldIndex, newIndex),
-        },
-      };
+      // moved across columns (already adjusted in onDragOver)
+      const next = prev;
+      if (snap) pendingMoveRef.current = activeId;
+      return next;
     });
 
-    // sync only if changed (compare with dragStart snapshot)
-    const snap = dragStartRef.current;
-    dragStartRef.current = null;
-
-    // ใช้ setTimeout 0 เพื่อให้ state update ด้านบนเสร็จก่อน แล้วค่อยอ่าน state ล่าสุด
-    // setTimeout(() => {
-    //   const cur = board; // board ใน closure อาจยังเก่า แต่เราจะ sync จาก state ล่าสุดด้วย setBoard callback ไม่ได้ง่าย
-    //   // วิธีง่ายและชัวร์: sync จาก state ปัจจุบันจริงด้วย setBoard functional?
-    //   // -> แก้: อ่านจาก state ผ่าน setBoard functional โดยคิวงาน sync หลัง setBoard เสร็จ: ใช้ refresh จาก server หลัง sync อยู่แล้ว
-    //   // ดังนั้นเราจะ sync โดยใช้ "board ณ ตอนนี้" ไม่เป๊ะ 100% ถ้า drag เร็วมาก
-    //   // ทางแก้จริง: ใช้ useRef เก็บ board ล่าสุด
-    // }, 0);
-
-    // ✅ ทางชัวร์: เรา sync โดยอิง "board ล่าสุด" ผ่าน ref
-    // (อัปเดต ref ทุกครั้งที่ board เปลี่ยนอยู่ด้านล่าง)
-    if (!snap) return;
-
-    const latest = boardRef.current;
-    if (!latest) return;
-
-    const toCol = findContainerOf(
-      activeId,
-      latest.columnCardIds,
-      latest.columns
-    );
-    if (!toCol) return;
-    const toIndex = (latest.columnCardIds[toCol] || []).indexOf(activeId);
-
-    const changed = snap.fromColId !== toCol || snap.fromIndex !== toIndex;
-    if (!changed) return;
-
-    // sync to backend
-    void syncMoveCard(activeId);
+    // Sync after state has been applied (next render)
+    // We trigger in an effect below.
   }
 
-  // keep latest board in ref for DnD sync
-  const boardRef = useRef<BoardState | null>(null);
+  // Effect to sync pending move
   useEffect(() => {
-    boardRef.current = board;
+    const cardId = pendingMoveRef.current;
+    if (!cardId) return;
+    const snapshot = boardRef.current;
+    if (!snapshot) return;
+
+    // const snapStart = dragStartRef.current; // (already null) – ok
+
+    // reset marker immediately to avoid double-run
+    pendingMoveRef.current = null;
+
+    (async () => {
+      try {
+        await syncMoveCardFromSnapshot(snapshot, cardId);
+        await refresh(snapshot.boardId);
+      } catch (e: any) {
+        setErrMsg(e?.message || "Move sync failed");
+        await refresh(snapshot.boardId);
+      }
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [board]);
 
   if (!board) {
     return (
       <div className="sb-root">
         <style>{css}</style>
+
         <div className="sb-header">
           <div>
             <div className="sb-title">Sprint Board</div>
             <div className="sb-subtitle">API mode (Fastify + MongoDB)</div>
           </div>
+
           <div className="sb-actions">
-            <input
-              className="sb-input sb-input-inline"
-              value={accountId}
-              onChange={(e) => setAccountId(e.target.value)}
-              placeholder="x-account-id"
-              title="x-account-id header"
-            />
             <button
-              className="sb-btn"
-              onClick={() => ensureBoard()}
+              className="sb-btn sb-btn-ghost"
+              onClick={() => refresh(boardId)}
               disabled={loading}
             >
-              {loading ? "Loading..." : "Init Board"}
+              {loading ? "Loading..." : "Retry"}
             </button>
           </div>
         </div>
 
-        {errMsg ? <div className="sb-alert">{errMsg}</div> : null}
-        <div className="sb-muted">API Base: {getApiBase()}</div>
+        <div className="sb-muted">
+          API Base: {getApiBase()}
+          <br />
+          sb_account_id: <span className="sb-mono">{accountId}</span>
+          <br />
+          sb_board_id: <span className="sb-mono">{boardId}</span>
+        </div>
+
+        {errMsg ? (
+          <div className="sb-alert">
+            {errMsg}
+            <div className="sb-muted" style={{ marginTop: 8 }}>
+              ถ้าได้ “Board not found” แปลว่า backend/Mongo ยังไม่มีบอร์ด id นี้
+            </div>
+          </div>
+        ) : null}
       </div>
     );
   }
@@ -590,21 +582,13 @@ export default function SprintBoardApi() {
         <div>
           <div className="sb-title">{board.name || "Sprint Board"}</div>
           <div className="sb-subtitle">
-            {/* Board: <span className="sb-mono">{board.boardId}</span> · v
-            {board.version} */}
+            Board: <span className="sb-mono">{board.boardId}</span> · v
+            {board.version}
             {loading ? " · syncing..." : ""}
           </div>
         </div>
 
         <div className="sb-actions">
-          {/* <input
-            className="sb-input sb-input-inline"
-            value={accountId}
-            onChange={(e) => setAccountId(e.target.value)}
-            placeholder="x-account-id"
-            title="x-account-id header"
-          /> */}
-
           <button
             className="sb-btn"
             onClick={() => setModal({ open: true, mode: "create_column" })}
@@ -618,18 +602,6 @@ export default function SprintBoardApi() {
             disabled={loading}
           >
             Refresh
-          </button>
-
-          <button
-            className="sb-btn sb-btn-ghost"
-            onClick={() => {
-              localStorage.removeItem(STORAGE_BOARD_ID);
-              setBoard(null);
-              ensureBoard();
-            }}
-            title="Create new board"
-          >
-            New Board
           </button>
         </div>
       </div>
@@ -1076,14 +1048,12 @@ const css = `
 .sb-btn-mini{padding:6px 10px; font-size:12px; border-radius:10px;}
 .sb-btn-danger{background:#fff1f2; color:#9f1239; border-color:#fecdd3;}
 
-.sb-input{border:1px solid #cbd5e1; border-radius:12px; padding:10px 12px; font-size:13px; outline:none; background:#fff;}
-.sb-input:focus{border-color:#0f172a; box-shadow:0 0 0 3px rgba(15,23,42,0.08);}
-.sb-input-inline{width:180px;}
-
 .sb-modal-backdrop{position:fixed; inset:0; background:rgba(15,23,42,0.42); display:flex; align-items:center; justify-content:center; padding:16px; z-index:1000;}
 .sb-modal{width:min(520px, 100%); background:#fff; border-radius:16px; border:1px solid #e2e8f0; padding:14px; box-shadow:0 12px 40px rgba(15,23,42,0.18);}
 .sb-modal-title{font-weight:900; font-size:16px; margin-bottom:10px;}
 .sb-label{display:flex; flex-direction:column; gap:6px; font-size:12px; color:#334155; margin-top:10px;}
+.sb-input{border:1px solid #cbd5e1; border-radius:12px; padding:10px 12px; font-size:13px; outline:none; background:#fff;}
+.sb-input:focus{border-color:#0f172a; box-shadow:0 0 0 3px rgba(15,23,42,0.08);}
 .sb-textarea{min-height:90px; resize:vertical;}
 .sb-modal-actions{display:flex; justify-content:flex-end; gap:10px; margin-top:14px;}
 
@@ -1091,51 +1061,15 @@ const css = `
 .sb-card-overlay{box-shadow:0 14px 50px rgba(15,23,42,0.25); border-color:#0f172a22;}
 
 .sb-menu{position:relative;}
-.sb-menu-btn{
-  list-style:none;
-  cursor:pointer;
-  border:1px solid #cbd5e1;
-  background:#fff;
-  border-radius:10px;
-  padding:6px 10px;
-  font-weight:900;
-  line-height:1;
-}
+.sb-menu-btn{list-style:none; cursor:pointer; border:1px solid #cbd5e1; background:#fff; border-radius:10px; padding:6px 10px; font-weight:900; line-height:1;}
 .sb-menu[open] .sb-menu-btn{border-color:#0f172a; box-shadow:0 0 0 3px rgba(15,23,42,0.08);}
-.sb-menu-pop{
-  position:absolute;
-  right:0;
-  margin-top:8px;
-  background:#fff;
-  border:1px solid #e2e8f0;
-  border-radius:12px;
-  box-shadow:0 12px 40px rgba(15,23,42,0.12);
-  padding:6px;
-  min-width:180px;
-  z-index:10;
-}
-.sb-menu-item{
-  width:100%;
-  text-align:left;
-  border:none;
-  background:transparent;
-  padding:8px 10px;
-  border-radius:10px;
-  cursor:pointer;
-  font-weight:700;
-}
+.sb-menu-pop{position:absolute; right:0; margin-top:8px; background:#fff; border:1px solid #e2e8f0; border-radius:12px; box-shadow:0 12px 40px rgba(15,23,42,0.12); padding:6px; min-width:180px; z-index:10;}
+.sb-menu-item{width:100%; text-align:left; border:none; background:transparent; padding:8px 10px; border-radius:10px; cursor:pointer; font-weight:700;}
 .sb-menu-item:hover{background:#f1f5f9;}
 .sb-menu-item:disabled{opacity:0.5; cursor:not-allowed;}
 .sb-danger{color:#9f1239;}
 .sb-menu-sep{height:1px; background:#eef2f7; margin:6px 0;}
 
-.sb-alert{
-  background:#fff7ed;
-  border:1px solid #fed7aa;
-  color:#9a3412;
-  padding:10px 12px;
-  border-radius:12px;
-  margin:10px 0 14px;
-}
+.sb-alert{background:#fff7ed; border:1px solid #fed7aa; color:#9a3412; padding:10px 12px; border-radius:12px; margin:10px 0 14px;}
 .sb-mono{font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;}
 `;
