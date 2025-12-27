@@ -1,0 +1,876 @@
+import React, { useEffect, useMemo, useState } from "react";
+import {
+  DndContext,
+  KeyboardSensor,
+  PointerSensor,
+  closestCorners,
+  useDroppable,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  arrayMove,
+  sortableKeyboardCoordinates,
+  useSortable,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { CSS } from "@dnd-kit/utilities";
+
+type ColumnId = string;
+
+type Column = {
+  id: ColumnId;
+  title: string;
+};
+
+type Card = {
+  id: string;
+  title: string;
+  description: string;
+  points: number;
+};
+
+type BoardState = {
+  columns: Column[];
+  cardsById: Record<string, Card>;
+  columnCardIds: Record<ColumnId, string[]>;
+};
+
+const STORAGE_KEY = "sprint_board_v2";
+
+function uid() {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const c: any = globalThis as any;
+  if (c?.crypto?.randomUUID) return c.crypto.randomUUID();
+  return `id_${Date.now()}_${Math.random().toString(16).slice(2)}`;
+}
+
+function safeLoad(): BoardState | null {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as BoardState;
+    if (!parsed?.columns || !parsed?.cardsById || !parsed?.columnCardIds)
+      return null;
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
+function safeSave(state: BoardState) {
+  try {
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(state));
+  } catch {
+    // ignore
+  }
+}
+
+function insertAt<T>(arr: T[], index: number, item: T) {
+  const next = arr.slice();
+  const i = Math.max(0, Math.min(index, next.length));
+  next.splice(i, 0, item);
+  return next;
+}
+
+function removeFrom<T>(arr: T[], item: T) {
+  const idx = arr.indexOf(item);
+  if (idx === -1) return arr.slice();
+  const next = arr.slice();
+  next.splice(idx, 1);
+  return next;
+}
+
+function isColumnId(id: string, columns: Column[]): id is ColumnId {
+  return columns.some((c) => c.id === id);
+}
+
+function findContainerOf(
+  id: string,
+  columnCardIds: Record<ColumnId, string[]>,
+  columns: Column[]
+): ColumnId | null {
+  if (isColumnId(id, columns)) return id;
+  for (const colId of Object.keys(columnCardIds)) {
+    if (columnCardIds[colId]?.includes(id)) return colId;
+  }
+  return null;
+}
+
+type ModalMode =
+  | { open: false }
+  | { open: true; mode: "create_card"; columnId: ColumnId }
+  | { open: true; mode: "edit_card"; cardId: string }
+  | { open: true; mode: "create_column" }
+  | { open: true; mode: "rename_column"; columnId: ColumnId };
+
+function SprintBoard() {
+  const [board, setBoard] = useState<BoardState>(() => {
+    const loaded = typeof window !== "undefined" ? safeLoad() : null;
+    if (loaded) return loaded;
+
+    // default columns
+    const todo = uid();
+    const inprog = uid();
+    const done = uid();
+
+    const a = uid();
+    const b = uid();
+    const c = uid();
+
+    return {
+      columns: [
+        { id: todo, title: "To Do" },
+        { id: inprog, title: "In Progress" },
+        { id: done, title: "Done" },
+      ],
+      cardsById: {
+        [a]: {
+          id: a,
+          title: "Setup sprint",
+          description: "Create tasks",
+          points: 2,
+        },
+        [b]: {
+          id: b,
+          title: "Implement API",
+          description: "Endpoints + auth",
+          points: 5,
+        },
+        [c]: {
+          id: c,
+          title: "UI polish",
+          description: "Spacing + states",
+          points: 3,
+        },
+      },
+      columnCardIds: {
+        [todo]: [a],
+        [inprog]: [b],
+        [done]: [c],
+      },
+    };
+  });
+
+  const [activeCardId, setActiveCardId] = useState<string | null>(null);
+  const activeCard = activeCardId ? board.cardsById[activeCardId] : null;
+
+  const [modal, setModal] = useState<ModalMode>({ open: false });
+
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    safeSave(board);
+  }, [board]);
+
+  const sensors = useSensors(
+    useSensor(PointerSensor, { activationConstraint: { distance: 6 } }),
+    useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates })
+  );
+
+  //   const columnIds = useMemo(
+  //     () => board.columns.map((c) => c.id),
+  //     [board.columns]
+  //   );
+
+  function ensureAtLeastOneColumn(prev: BoardState): BoardState {
+    if (prev.columns.length > 0) return prev;
+    const id = uid();
+    return {
+      ...prev,
+      columns: [{ id, title: "To Do" }],
+      columnCardIds: { ...prev.columnCardIds, [id]: [] },
+    };
+  }
+
+  // ---------- Columns ----------
+  function addColumn(title: string) {
+    const id = uid();
+    setBoard((prev) => ({
+      ...prev,
+      columns: [...prev.columns, { id, title: title.trim() || "New Column" }],
+      columnCardIds: { ...prev.columnCardIds, [id]: [] },
+    }));
+  }
+
+  function renameColumn(columnId: ColumnId, title: string) {
+    setBoard((prev) => ({
+      ...prev,
+      columns: prev.columns.map((c) =>
+        c.id === columnId ? { ...c, title: title.trim() || c.title } : c
+      ),
+    }));
+  }
+
+  function deleteColumn(
+    columnId: ColumnId,
+    mode: "move_cards" | "delete_cards"
+  ) {
+    setBoard((prev0) => {
+      const prev = ensureAtLeastOneColumn(prev0);
+
+      // กันลบคอลัมน์สุดท้าย
+      if (prev.columns.length <= 1) return prev;
+
+      const remainingCols = prev.columns.filter((c) => c.id !== columnId);
+      const removedCardIds = prev.columnCardIds[columnId] ?? [];
+
+      const nextColumnCardIds = { ...prev.columnCardIds };
+      delete nextColumnCardIds[columnId];
+
+      const nextCardsById = { ...prev.cardsById };
+
+      if (mode === "delete_cards") {
+        for (const cid of removedCardIds) delete nextCardsById[cid];
+      } else {
+        // move to first remaining column to avoid data loss
+        const targetId = remainingCols[0].id;
+        nextColumnCardIds[targetId] = [
+          ...nextColumnCardIds[targetId],
+          ...removedCardIds,
+        ];
+      }
+
+      return {
+        columns: remainingCols,
+        cardsById: nextCardsById,
+        columnCardIds: nextColumnCardIds,
+      };
+    });
+  }
+
+  // ---------- Cards ----------
+  function createCard(columnId: ColumnId, card: Omit<Card, "id">) {
+    const id = uid();
+    setBoard((prev) => ({
+      ...prev,
+      cardsById: { ...prev.cardsById, [id]: { id, ...card } },
+      columnCardIds: {
+        ...prev.columnCardIds,
+        [columnId]: [id, ...(prev.columnCardIds[columnId] ?? [])],
+      },
+    }));
+  }
+
+  function updateCard(cardId: string, patch: Partial<Omit<Card, "id">>) {
+    setBoard((prev) => ({
+      ...prev,
+      cardsById: {
+        ...prev.cardsById,
+        [cardId]: { ...prev.cardsById[cardId], ...patch },
+      },
+    }));
+  }
+
+  function removeCard(cardId: string) {
+    setBoard((prev) => {
+      const nextCards = { ...prev.cardsById };
+      delete nextCards[cardId];
+
+      const nextCols = { ...prev.columnCardIds };
+      for (const colId of Object.keys(nextCols)) {
+        nextCols[colId] = (nextCols[colId] ?? []).filter((id) => id !== cardId);
+      }
+
+      return { ...prev, cardsById: nextCards, columnCardIds: nextCols };
+    });
+  }
+
+  // ---------- DnD ----------
+  function handleDragStart(e: any) {
+    const id = String(e.active.id);
+    if (!isColumnId(id, board.columns)) setActiveCardId(id);
+  }
+
+  function handleDragOver(e: any) {
+    const activeId = String(e.active.id);
+    const overId = e.over ? String(e.over.id) : null;
+    if (!overId) return;
+    if (isColumnId(activeId, board.columns)) return;
+
+    setBoard((prev) => {
+      const activeCol = findContainerOf(
+        activeId,
+        prev.columnCardIds,
+        prev.columns
+      );
+      const overCol = findContainerOf(overId, prev.columnCardIds, prev.columns);
+      if (!activeCol || !overCol) return prev;
+      if (activeCol === overCol) return prev;
+
+      const activeList = prev.columnCardIds[activeCol] ?? [];
+      const overList = prev.columnCardIds[overCol] ?? [];
+
+      const nextActiveList = removeFrom(activeList, activeId);
+
+      let newIndex = overList.length;
+      if (!isColumnId(overId, prev.columns)) {
+        const overIndex = overList.indexOf(overId);
+        newIndex = overIndex >= 0 ? overIndex : overList.length;
+      }
+
+      if (overList.includes(activeId)) return prev;
+
+      const nextOverList = insertAt(overList, newIndex, activeId);
+
+      return {
+        ...prev,
+        columnCardIds: {
+          ...prev.columnCardIds,
+          [activeCol]: nextActiveList,
+          [overCol]: nextOverList,
+        },
+      };
+    });
+  }
+
+  function handleDragEnd(e: any) {
+    const activeId = String(e.active.id);
+    const overId = e.over ? String(e.over.id) : null;
+    setActiveCardId(null);
+    if (!overId) return;
+    if (isColumnId(activeId, board.columns)) return;
+
+    setBoard((prev) => {
+      const activeCol = findContainerOf(
+        activeId,
+        prev.columnCardIds,
+        prev.columns
+      );
+      const overCol = findContainerOf(overId, prev.columnCardIds, prev.columns);
+      if (!activeCol || !overCol) return prev;
+
+      // moved across columns already in onDragOver
+      if (activeCol !== overCol) return prev;
+
+      const list = prev.columnCardIds[activeCol] ?? [];
+      const oldIndex = list.indexOf(activeId);
+      if (oldIndex === -1) return prev;
+
+      let newIndex = list.length - 1;
+      if (!isColumnId(overId, prev.columns)) {
+        const overIndex = list.indexOf(overId);
+        if (overIndex !== -1) newIndex = overIndex;
+      }
+
+      if (oldIndex === newIndex) return prev;
+
+      return {
+        ...prev,
+        columnCardIds: {
+          ...prev.columnCardIds,
+          [activeCol]: arrayMove(list, oldIndex, newIndex),
+        },
+      };
+    });
+  }
+
+  return (
+    <div className="sb-root">
+      <style>{css}</style>
+
+      <div className="sb-header">
+        <div>
+          <div className="sb-title">Sprint Board</div>
+          <div className="sb-subtitle">Dynamic columns + drag & drop</div>
+        </div>
+
+        <div className="sb-actions">
+          <button
+            className="sb-btn"
+            onClick={() => setModal({ open: true, mode: "create_column" })}
+          >
+            + Column
+          </button>
+          <button
+            className="sb-btn sb-btn-ghost"
+            onClick={() => {
+              localStorage.removeItem(STORAGE_KEY);
+              window.location.reload();
+            }}
+            title="Reset (reload)"
+          >
+            Reset
+          </button>
+        </div>
+      </div>
+
+      <DndContext
+        sensors={sensors}
+        collisionDetection={closestCorners}
+        onDragStart={handleDragStart}
+        onDragOver={handleDragOver}
+        onDragEnd={handleDragEnd}
+      >
+        <div className="sb-board">
+          {board.columns.map((col) => (
+            <ColumnView
+              key={col.id}
+              col={col}
+              columnsCount={board.columns.length}
+              cardIds={board.columnCardIds[col.id] ?? []}
+              cardsById={board.cardsById}
+              onAddCard={() =>
+                setModal({ open: true, mode: "create_card", columnId: col.id })
+              }
+              onEditCard={(cardId) =>
+                setModal({ open: true, mode: "edit_card", cardId })
+              }
+              onRemoveCard={removeCard}
+              onRenameColumn={() =>
+                setModal({
+                  open: true,
+                  mode: "rename_column",
+                  columnId: col.id,
+                })
+              }
+              onDeleteColumnMoveCards={() => {
+                if (
+                  confirm(
+                    "Delete this column? Cards will be moved to the first column."
+                  )
+                ) {
+                  deleteColumn(col.id, "move_cards");
+                }
+              }}
+              onDeleteColumnAndCards={() => {
+                if (confirm("Delete this column AND all cards in it?")) {
+                  deleteColumn(col.id, "delete_cards");
+                }
+              }}
+            />
+          ))}
+        </div>
+
+        {activeCard ? (
+          <div className="sb-drag-overlay" aria-hidden>
+            <div className="sb-card sb-card-overlay">
+              <div className="sb-card-top">
+                <div className="sb-card-title">
+                  {activeCard.title || "(Untitled)"}
+                </div>
+                <div className="sb-pill">{activeCard.points} pt</div>
+              </div>
+              {activeCard.description ? (
+                <div className="sb-card-desc">{activeCard.description}</div>
+              ) : (
+                <div className="sb-card-desc sb-muted">No description</div>
+              )}
+            </div>
+          </div>
+        ) : null}
+      </DndContext>
+
+      {modal.open && modal.mode === "create_card" && (
+        <CardModal
+          mode="create"
+          card={null}
+          onClose={() => setModal({ open: false })}
+          onSubmit={(data) => {
+            createCard(modal.columnId, data);
+            setModal({ open: false });
+          }}
+        />
+      )}
+
+      {modal.open && modal.mode === "edit_card" && (
+        <CardModal
+          mode="edit"
+          card={board.cardsById[modal.cardId]}
+          onClose={() => setModal({ open: false })}
+          onSubmit={(data) => {
+            updateCard(modal.cardId, data);
+            setModal({ open: false });
+          }}
+        />
+      )}
+
+      {modal.open && modal.mode === "create_column" && (
+        <ColumnModal
+          title="Create Column"
+          initialValue=""
+          onClose={() => setModal({ open: false })}
+          onSubmit={(name) => {
+            addColumn(name);
+            setModal({ open: false });
+          }}
+        />
+      )}
+
+      {modal.open && modal.mode === "rename_column" && (
+        <ColumnModal
+          title="Rename Column"
+          initialValue={
+            board.columns.find((c) => c.id === modal.columnId)?.title ?? ""
+          }
+          onClose={() => setModal({ open: false })}
+          onSubmit={(name) => {
+            renameColumn(modal.columnId, name);
+            setModal({ open: false });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function ColumnView(props: {
+  col: Column;
+  columnsCount: number;
+  cardIds: string[];
+  cardsById: Record<string, Card>;
+  onAddCard: () => void;
+  onEditCard: (cardId: string) => void;
+  onRemoveCard: (cardId: string) => void;
+  onRenameColumn: () => void;
+  onDeleteColumnMoveCards: () => void;
+  onDeleteColumnAndCards: () => void;
+}) {
+  const { setNodeRef, isOver } = useDroppable({ id: props.col.id });
+
+  return (
+    <div className="sb-col">
+      <div className="sb-col-header">
+        <div className="sb-col-title">{props.col.title}</div>
+
+        <div className="sb-col-tools">
+          <button className="sb-btn sb-btn-mini" onClick={props.onAddCard}>
+            + Add
+          </button>
+
+          <details className="sb-menu">
+            <summary className="sb-menu-btn" title="Column menu">
+              ⋯
+            </summary>
+            <div className="sb-menu-pop">
+              <button className="sb-menu-item" onClick={props.onRenameColumn}>
+                Rename
+              </button>
+
+              <div className="sb-menu-sep" />
+
+              <button
+                className="sb-menu-item"
+                onClick={props.onDeleteColumnMoveCards}
+                disabled={props.columnsCount <= 1}
+                title={
+                  props.columnsCount <= 1 ? "Cannot delete the last column" : ""
+                }
+              >
+                Delete (move cards)
+              </button>
+              <button
+                className="sb-menu-item sb-danger"
+                onClick={props.onDeleteColumnAndCards}
+                disabled={props.columnsCount <= 1}
+                title={
+                  props.columnsCount <= 1 ? "Cannot delete the last column" : ""
+                }
+              >
+                Delete + cards
+              </button>
+            </div>
+          </details>
+        </div>
+      </div>
+
+      <SortableContext
+        items={props.cardIds}
+        strategy={verticalListSortingStrategy}
+      >
+        <div
+          ref={setNodeRef}
+          className={`sb-col-body ${isOver ? "sb-col-over" : ""}`}
+        >
+          {props.cardIds.length === 0 ? (
+            <div className="sb-empty">Drop cards here</div>
+          ) : null}
+
+          {props.cardIds.map((cardId) => (
+            <SortableCard
+              key={cardId}
+              card={props.cardsById[cardId]}
+              onEdit={() => props.onEditCard(cardId)}
+              onRemove={() => props.onRemoveCard(cardId)}
+            />
+          ))}
+        </div>
+      </SortableContext>
+    </div>
+  );
+}
+
+function SortableCard(props: {
+  card: Card;
+  onEdit: () => void;
+  onRemove: () => void;
+}) {
+  const {
+    attributes,
+    listeners,
+    setNodeRef,
+    transform,
+    transition,
+    isDragging,
+  } = useSortable({
+    id: props.card.id,
+  });
+
+  const style: React.CSSProperties = {
+    transform: CSS.Transform.toString(transform),
+    transition,
+    opacity: isDragging ? 0.6 : 1,
+  };
+
+  return (
+    <div ref={setNodeRef} style={style} className="sb-card">
+      <div className="sb-card-top">
+        <div className="sb-card-title">{props.card.title || "(Untitled)"}</div>
+        <div className="sb-pill">{props.card.points} pt</div>
+      </div>
+
+      {props.card.description ? (
+        <div className="sb-card-desc">{props.card.description}</div>
+      ) : (
+        <div className="sb-card-desc sb-muted">No description</div>
+      )}
+
+      <div className="sb-card-actions">
+        <button
+          className="sb-btn sb-btn-mini sb-btn-ghost"
+          onClick={props.onEdit}
+        >
+          Edit
+        </button>
+        <button
+          className="sb-btn sb-btn-mini sb-btn-danger"
+          onClick={props.onRemove}
+        >
+          Delete
+        </button>
+        <div className="sb-spacer" />
+        <button
+          className="sb-handle"
+          {...attributes}
+          {...listeners}
+          title="Drag"
+        >
+          ⠿
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function CardModal(props: {
+  mode: "create" | "edit";
+  card: Card | null;
+  onClose: () => void;
+  onSubmit: (data: Omit<Card, "id">) => void;
+}) {
+  const [title, setTitle] = useState(props.card?.title ?? "");
+  const [description, setDescription] = useState(props.card?.description ?? "");
+  const [points, setPoints] = useState(props.card?.points ?? 1);
+
+  useEffect(() => {
+    setTitle(props.card?.title ?? "");
+    setDescription(props.card?.description ?? "");
+    setPoints(props.card?.points ?? 1);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [props.card?.id, props.mode]);
+
+  return (
+    <div
+      className="sb-modal-backdrop"
+      onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div className="sb-modal">
+        <div className="sb-modal-title">
+          {props.mode === "create" ? "Create Card" : "Edit Card"}
+        </div>
+
+        <label className="sb-label">
+          Title
+          <input
+            className="sb-input"
+            value={title}
+            onChange={(e) => setTitle(e.target.value)}
+          />
+        </label>
+
+        <label className="sb-label">
+          Description
+          <textarea
+            className="sb-input sb-textarea"
+            value={description}
+            onChange={(e) => setDescription(e.target.value)}
+          />
+        </label>
+
+        <label className="sb-label">
+          Points
+          <input
+            className="sb-input"
+            type="number"
+            min={0}
+            step={1}
+            value={points}
+            onChange={(e) => setPoints(Number(e.target.value))}
+          />
+        </label>
+
+        <div className="sb-modal-actions">
+          <button className="sb-btn sb-btn-ghost" onClick={props.onClose}>
+            Cancel
+          </button>
+          <button
+            className="sb-btn"
+            onClick={() =>
+              props.onSubmit({
+                title: title.trim(),
+                description: description.trim(),
+                points: Number.isFinite(points) ? points : 0,
+              })
+            }
+          >
+            {props.mode === "create" ? "Create" : "Save"}
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function ColumnModal(props: {
+  title: string;
+  initialValue: string;
+  onClose: () => void;
+  onSubmit: (name: string) => void;
+}) {
+  const [name, setName] = useState(props.initialValue);
+
+  useEffect(() => setName(props.initialValue), [props.initialValue]);
+
+  return (
+    <div
+      className="sb-modal-backdrop"
+      onMouseDown={(e) => e.target === e.currentTarget && props.onClose()}
+      role="dialog"
+      aria-modal="true"
+    >
+      <div className="sb-modal">
+        <div className="sb-modal-title">{props.title}</div>
+
+        <label className="sb-label">
+          Column name
+          <input
+            className="sb-input"
+            value={name}
+            onChange={(e) => setName(e.target.value)}
+            autoFocus
+          />
+        </label>
+
+        <div className="sb-modal-actions">
+          <button className="sb-btn sb-btn-ghost" onClick={props.onClose}>
+            Cancel
+          </button>
+          <button className="sb-btn" onClick={() => props.onSubmit(name)}>
+            Save
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+const css = `
+.sb-root{font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Arial; padding:18px; color:#0f172a; background:#f8fafc; min-height:100vh;}
+.sb-header{display:flex; align-items:flex-end; justify-content:space-between; gap:12px; margin-bottom:14px;}
+.sb-title{font-size:22px; font-weight:800;}
+.sb-subtitle{font-size:13px; color:#64748b; margin-top:4px;}
+.sb-actions{display:flex; gap:8px;}
+.sb-board{display:grid; grid-template-columns: repeat(3, minmax(260px, 1fr)); gap:14px; align-items:start;}
+
+.sb-col{background:#fff; border:1px solid #e2e8f0; border-radius:14px; box-shadow:0 1px 0 rgba(15,23,42,0.03); overflow:visible;}
+.sb-col-header{display:flex; align-items:center; justify-content:space-between; padding:12px 12px 10px; border-bottom:1px solid #eef2f7; background:#fbfdff;}
+.sb-col-title{font-weight:800;}
+.sb-col-tools{display:flex; gap:8px; align-items:center;}
+.sb-col-body{padding:12px; min-height:260px; display:flex; flex-direction:column; gap:10px;}
+.sb-col-over{background:#f1f5f9;}
+.sb-empty{border:1px dashed #cbd5e1; border-radius:12px; padding:12px; color:#94a3b8; text-align:center; background:#f8fafc;}
+
+.sb-card{background:#fff; border:1px solid #e2e8f0; border-radius:14px; padding:10px 10px 8px; box-shadow:0 1px 0 rgba(15,23,42,0.03);}
+.sb-card-top{display:flex; align-items:flex-start; justify-content:space-between; gap:8px;}
+.sb-card-title{font-weight:800; font-size:14px; line-height:1.25;}
+.sb-card-desc{margin-top:6px; font-size:12.5px; color:#334155; white-space:pre-wrap; word-break:break-word;}
+.sb-muted{color:#94a3b8;}
+.sb-card-actions{margin-top:10px; display:flex; gap:8px; align-items:center;}
+.sb-spacer{flex:1;}
+.sb-handle{cursor:grab; border:1px solid #e2e8f0; background:#f8fafc; border-radius:10px; padding:6px 10px; font-size:14px;}
+.sb-handle:active{cursor:grabbing;}
+.sb-pill{font-size:12px; background:#f1f5f9; border:1px solid #e2e8f0; color:#0f172a; padding:2px 8px; border-radius:999px; white-space:nowrap;}
+
+.sb-btn{border:1px solid #0f172a; background:#0f172a; color:#fff; border-radius:12px; padding:10px 12px; font-weight:700; font-size:13px; cursor:pointer;}
+.sb-btn:hover{filter:brightness(1.06);}
+.sb-btn:active{transform:translateY(1px);}
+.sb-btn-ghost{background:#fff; color:#0f172a; border-color:#cbd5e1;}
+.sb-btn-mini{padding:6px 10px; font-size:12px; border-radius:10px;}
+.sb-btn-danger{background:#fff1f2; color:#9f1239; border-color:#fecdd3;}
+
+.sb-modal-backdrop{position:fixed; inset:0; background:rgba(15,23,42,0.42); display:flex; align-items:center; justify-content:center; padding:16px; z-index:1000;}
+.sb-modal{width:min(520px, 100%); background:#fff; border-radius:16px; border:1px solid #e2e8f0; padding:14px; box-shadow:0 12px 40px rgba(15,23,42,0.18);}
+.sb-modal-title{font-weight:900; font-size:16px; margin-bottom:10px;}
+.sb-label{display:flex; flex-direction:column; gap:6px; font-size:12px; color:#334155; margin-top:10px;}
+.sb-input{border:1px solid #cbd5e1; border-radius:12px; padding:10px 12px; font-size:13px; outline:none;}
+.sb-input:focus{border-color:#0f172a; box-shadow:0 0 0 3px rgba(15,23,42,0.08);}
+.sb-textarea{min-height:90px; resize:vertical;}
+.sb-modal-actions{display:flex; justify-content:flex-end; gap:10px; margin-top:14px;}
+
+.sb-drag-overlay{position:fixed; pointer-events:none; left:18px; bottom:18px; z-index:1200; width:min(360px, calc(100vw - 36px));}
+.sb-card-overlay{box-shadow:0 14px 50px rgba(15,23,42,0.25); border-color:#0f172a22;}
+
+/* Column menu */
+.sb-menu{position:relative;}
+.sb-menu-btn{
+  list-style:none;
+  cursor:pointer;
+  border:1px solid #cbd5e1;
+  background:#fff;
+  border-radius:10px;
+  padding:6px 10px;
+  font-weight:900;
+  line-height:1;
+}
+.sb-menu[open] .sb-menu-btn{border-color:#0f172a; box-shadow:0 0 0 3px rgba(15,23,42,0.08);}
+.sb-menu-pop{
+  position:absolute;
+  right:0;
+  margin-top:8px;
+  background:#fff;
+  border:1px solid #e2e8f0;
+  border-radius:12px;
+  box-shadow:0 12px 40px rgba(15,23,42,0.12);
+  padding:6px;
+  min-width:180px;
+  z-index:10;
+}
+.sb-menu-item{
+  width:100%;
+  text-align:left;
+  border:none;
+  background:transparent;
+  padding:8px 10px;
+  border-radius:10px;
+  cursor:pointer;
+  font-weight:700;
+}
+.sb-menu-item:hover{background:#f1f5f9;}
+.sb-menu-item:disabled{opacity:0.5; cursor:not-allowed;}
+.sb-danger{color:#9f1239;}
+.sb-menu-sep{height:1px; background:#eef2f7; margin:6px 0;}
+`;
+
+export default SprintBoard;
